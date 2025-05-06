@@ -8,8 +8,11 @@ import tkinter as tk
 from tkinter import font as tkfont
 import os
 import sys
+from datetime import datetime
 
 running = True
+current_log_row = None
+session_score = 0  # 🟩 คะแนน session ล่าสุด (ไม่เกี่ยวกับคะแนนสะสม)
 
 # ค้นหาพอร์ตของ ESP32 อัตโนมัติ
 def find_serial_port():
@@ -27,15 +30,9 @@ creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", sco
     "https://www.googleapis.com/auth/drive"
 ])
 client = gspread.authorize(creds)
-sheet = client.open("Userdata").sheet1
-
-# เชื่อมต่อ ESP32
-serial_port = find_serial_port()
-if serial_port:
-    ser = serial.Serial(serial_port, 115200, timeout=2)
-else:
-    print("ไม่พบ ESP32! โปรดเชื่อมต่อแล้วลองใหม่")
-    exit()
+spreadsheet = client.open("Userdata")
+sheet = spreadsheet.worksheet("sheet1")     # คะแนนสะสม
+sheet_log = spreadsheet.worksheet("log")     # Log session ปัจจุบัน
 
 # ฟังก์ชันดึงข้อมูลผู้ใช้จาก Google Sheets
 def get_user_info(user_id):
@@ -49,26 +46,50 @@ def get_user_info(user_id):
         pass
     return None, None
 
-# ฟังก์ชันอัปเดตคะแนนใน Google Sheets
-def update_user_score(user_id, new_score):
+# อัปเดตคะแนนสะสมรวมใน sheet1
+def update_user_score(user_id, new_total_score):
     try:
         cell = sheet.find(user_id)
         if cell:
-            print(f"Updating {user_id} to new score: {new_score}")
-            sheet.update_cell(cell.row, 3, new_score)
+            sheet.update_cell(cell.row, 3, new_total_score)
     except Exception as e:
-        print(f"Error updating Google Sheets: {e}")
+        print(f"Error updating user score: {e}")
+
+# เริ่มบันทึก log ใหม่เมื่อ Login
+def start_log_record(user_id, user_name, score):
+    global current_log_row
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sheet_log.append_row([user_id, user_name, score, timestamp])
+    current_log_row = len(sheet_log.get_all_values())  # แถว log ปัจจุบัน
+
+# อัปเดต log ในแถวเดิม
+def update_log_score(score):
+    global current_log_row
+    if current_log_row:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            sheet_log.update_cell(current_log_row, 3, score)
+            sheet_log.update_cell(current_log_row, 4, timestamp)
+        except Exception as e:
+            print(f"Error updating log row: {e}")
+
+# ล้าง log row
+def reset_log_row():
+    global current_log_row, session_score
+    current_log_row = None
+    session_score = 0
 
 # ฟังก์ชัน Restart GUI
 def restart_gui():
-    print("Restarting GUI...")
     global running
     running = False
+    reset_log_row()
     ser.close()
     os.execl(sys.executable, sys.executable, *sys.argv)
 
 # ฟังก์ชันล็อกอินและส่งข้อมูลไปยัง ESP32
 def barcode_scanned(event=None):
+    global session_score
     user_id = entry.get().strip()
     if not user_id:
         status_label.config(text="กรุณากรอก ID", fg="#e53935")
@@ -76,21 +97,23 @@ def barcode_scanned(event=None):
 
     user_name, user_score = get_user_info(user_id)
     if user_name:
-        data_to_send = f"{user_id},{user_name},{user_score}\n"
+        session_score = 0  # 🟩 รีเซ็ตคะแนน session ใหม่
+        data_to_send = f"{user_id},{user_name},{session_score}\n"
         ser.write(data_to_send.encode())
         time.sleep(1)
         status_label.config(text=f"ยินดีต้อนรับ {user_name}!", fg="#4caf50")
+        start_log_record(user_id, user_name, session_score)
     else:
         status_label.config(text="ไม่พบผู้ใช้!", fg="#e53935")
-    
+
     entry.delete(0, tk.END)
 
-# ฟังก์ชันรับข้อมูลจาก ESP32 และอัปเดตคะแนนใน Google Sheets
+# รับข้อมูลจาก ESP32 และอัปเดตคะแนน
 last_score = None
 last_update_time = time.time()
 
 def listen_for_scores():
-    global last_score, last_update_time, running
+    global last_score, last_update_time, running, session_score
     while running:
         try:
             if ser.in_waiting:
@@ -106,12 +129,19 @@ def listen_for_scores():
                     if new_score.isdigit():
                         new_score = int(new_score)
 
+                        # เช็กว่าคะแนน session เปลี่ยนแปลง
                         if new_score != last_score:
                             last_score = new_score
+                            session_score = new_score
                             last_update_time = time.time()
-                        
-                        update_user_score(user_id, new_score)
-                        print(f"Updated {user_name} ({user_id}) score: {new_score}")
+
+                            # ดึงคะแนนสะสมเดิมจาก sheet1
+                            _, total_before = get_user_info(user_id)
+                            total_after = total_before + session_score
+                            update_user_score(user_id, total_after)
+                            update_log_score(session_score)
+
+                            print(f"Updated {user_name} ({user_id}) session: {session_score}, total: {total_after}")
 
             if time.time() - last_update_time >= 120:
                 restart_gui()
@@ -119,24 +149,30 @@ def listen_for_scores():
         except Exception as e:
             print("เกิดข้อผิดพลาด:", e)
 
-# ฟังก์ชันปิดโปรแกรมอย่างสมบูรณ์
+# ปิดโปรแกรม
 def on_closing():
     global running
     running = False
+    reset_log_row()
     ser.close()
     root.destroy()
 
-# ฟังก์ชันจัดกึ่งกลางหน้าจอ
+# จัดกึ่งกลางหน้าจอ
 def center_window(root, width=400, height=300):
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
-    
     position_x = (screen_width // 2) - (width // 2)
     position_y = (screen_height // 2) - (height // 2)
-    
     root.geometry(f"{width}x{height}+{position_x}+{position_y}")
 
-# -------------------------- เริ่มสร้าง GUI ---------------------------
+# ---------------- GUI ----------------
+serial_port = find_serial_port()
+if serial_port:
+    ser = serial.Serial(serial_port, 115200, timeout=2)
+else:
+    print("ไม่พบ ESP32! โปรดเชื่อมต่อแล้วลองใหม่")
+    exit()
+
 root = tk.Tk()
 root.title("🚀 Login System")
 root.configure(bg="#f0f4f8")
@@ -160,7 +196,6 @@ login_button.grid(row=0, column=1)
 status_label = tk.Label(root, text="", font=text_font, bg="#f0f4f8", fg="#e53935")
 status_label.pack(pady=10)
 
-# เพิ่มปุ่ม Reset GUI
 reset_button = tk.Button(root, text="🔄 Reset", font=text_font, bg="#2196f3", fg="white", command=restart_gui)
 reset_button.pack(pady=(5, 10))
 
@@ -172,7 +207,6 @@ entry.bind("<Return>", barcode_scanned)
 
 root.protocol("WM_DELETE_WINDOW", on_closing)
 
-# เริ่มรับข้อมูลคะแนนจาก ESP32
 score_thread = threading.Thread(target=listen_for_scores, daemon=True)
 score_thread.start()
 
